@@ -1,0 +1,11 @@
+type: grafanasecretsmanager
+
+status:
+  class: provider
+  stability:
+    alpha: [provider]
+  distributions: [contrib]
+  codeowners:
+    # TODO: replace with the real GitHub handle(s) of the maintaining code owner(s)
+    # before opening the PR (a tracking issue + maintainer sign-off is also required).
+    active: [YOUR_GITHUB_HANDLE]
