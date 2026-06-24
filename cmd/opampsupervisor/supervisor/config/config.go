@@ -40,6 +40,7 @@ type Supervisor struct {
 	Storage      Storage      `mapstructure:"storage"`
 	Telemetry    Telemetry    `mapstructure:"telemetry"`
 	HealthCheck  HealthCheck  `mapstructure:"healthcheck"`
+	Secrets      Secrets      `mapstructure:"secrets"`
 }
 
 // Load loads the Supervisor config from a file.
@@ -93,6 +94,35 @@ func (s Supervisor) Validate() error {
 		return err
 	}
 
+	if err := s.Secrets.validate(s.Server.Endpoint); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// Secrets configures the supervisor's secrets broker, which serves secrets
+// pushed by the OpAMP server to the managed collector over a loopback endpoint.
+type Secrets struct {
+	// Enabled turns on the secrets broker. Requires a TLS server endpoint
+	// (https or wss) so secrets are never received over a plaintext connection.
+	Enabled bool `mapstructure:"enabled"`
+	// prevent unkeyed literal initialization
+	_ struct{}
+}
+
+func (s Secrets) validate(serverEndpoint string) error {
+	if !s.Enabled {
+		return nil
+	}
+	u, err := url.Parse(serverEndpoint)
+	if err != nil {
+		// server endpoint validation already reports a clearer error.
+		return nil
+	}
+	if u.Scheme != "https" && u.Scheme != "wss" {
+		return fmt.Errorf("secrets::enabled requires a TLS server::endpoint (https or wss), got scheme %q", u.Scheme)
+	}
 	return nil
 }
 

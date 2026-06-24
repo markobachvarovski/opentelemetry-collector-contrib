@@ -53,6 +53,7 @@ import (
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/cmd/opampsupervisor/supervisor/commander"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/cmd/opampsupervisor/supervisor/config"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/cmd/opampsupervisor/supervisor/secrets"
 	supervisorTelemetry "github.com/open-telemetry/opentelemetry-collector-contrib/cmd/opampsupervisor/supervisor/telemetry"
 )
 
@@ -181,6 +182,10 @@ type Supervisor struct {
 	// The HTTP server for health check endpoint
 	healthCheckServer   *http.Server
 	healthCheckServerWG sync.WaitGroup
+
+	// The loopback secrets broker serving secrets to the collector. Nil when the
+	// secrets feature is disabled.
+	secretsStore *secrets.Store
 
 	telemetrySettings telemetrySettings
 
@@ -356,6 +361,12 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	err = s.loadAndWriteInitialMergedConfig()
 	if err != nil {
 		return fmt.Errorf("failed loading initial config: %w", err)
+	}
+
+	// Start the secrets broker before creating the commander so its endpoint and
+	// token can be injected into the collector's environment.
+	if err = s.startSecretsServer(); err != nil {
+		return fmt.Errorf("failed to start secrets server: %w", err)
 	}
 
 	flags := []string{
@@ -718,6 +729,13 @@ func (s *Supervisor) startOpAMPClient() error {
 		return err
 	}
 
+	// Advertise the secrets custom capability so the server may push secrets.
+	if s.config.Secrets.Enabled {
+		if err := s.setCustomCapabilities(nil); err != nil {
+			return err
+		}
+	}
+
 	// Set heartbeat interval if the agent supports it
 	if s.config.Capabilities.ReportsHeartbeat {
 		d := time.Duration(s.heartbeatIntervalSeconds) * time.Second
@@ -869,7 +887,7 @@ func (s *Supervisor) handleAgentOpAMPMessage(conn serverTypes.Connection, messag
 	// Proxy client capabilities to server
 	if message.CustomCapabilities != nil {
 		span.AddEvent("Received customCapabilities")
-		err := s.opampClient.SetCustomCapabilities(message.CustomCapabilities)
+		err := s.setCustomCapabilities(message.CustomCapabilities)
 		if err != nil {
 			span.SetStatus(codes.Error, fmt.Sprintf("Failed to send custom capabilities to OpAMP server: %s", err.Error()))
 			s.telemetrySettings.Logger.Error("Failed to send custom capabilities to OpAMP server")
@@ -930,6 +948,63 @@ func (s *Supervisor) forwardCustomMessagesToServerLoop() {
 			return
 		}
 	}
+}
+
+// startSecretsServer starts the loopback secrets broker (when enabled) and
+// injects its endpoint and token into the collector's environment so the
+// grafanasecretsmanager confmap provider can read secrets locally.
+func (s *Supervisor) startSecretsServer() error {
+	if !s.config.Secrets.Enabled {
+		return nil
+	}
+
+	store, err := secrets.NewStore(s.telemetrySettings.Logger)
+	if err != nil {
+		return err
+	}
+	if err = store.Start(); err != nil {
+		return err
+	}
+	s.secretsStore = store
+
+	if s.config.Agent.Env == nil {
+		s.config.Agent.Env = map[string]string{}
+	}
+	s.config.Agent.Env[secrets.EndpointEnvVar] = store.Endpoint()
+	s.config.Agent.Env[secrets.TokenEnvVar] = store.Token()
+
+	s.telemetrySettings.Logger.Debug("Secrets broker started", zap.String("endpoint", store.Endpoint()))
+	return nil
+}
+
+// setCustomCapabilities forwards the agent's custom capabilities to the server,
+// merging in the supervisor's own secrets capability when the feature is enabled
+// so it is not clobbered by the agent-reported set.
+func (s *Supervisor) setCustomCapabilities(agentCapabilities *protobufs.CustomCapabilities) error {
+	capabilities := []string{}
+	if agentCapabilities != nil {
+		capabilities = append(capabilities, agentCapabilities.Capabilities...)
+	}
+	if s.config.Secrets.Enabled && !slices.Contains(capabilities, secrets.CapabilityName) {
+		capabilities = append(capabilities, secrets.CapabilityName)
+	}
+	return s.opampClient.SetCustomCapabilities(&protobufs.CustomCapabilities{Capabilities: capabilities})
+}
+
+// processSecretsMessage decodes a secrets custom message and updates the
+// in-memory secrets cache. It never logs secret names or values.
+func (s *Supervisor) processSecretsMessage(cm *protobufs.CustomMessage) {
+	if s.secretsStore == nil {
+		s.telemetrySettings.Logger.Warn("Received secrets message but secrets broker is not running; ignoring")
+		return
+	}
+	parsed, err := secrets.ParsePayload(cm.Data)
+	if err != nil {
+		s.telemetrySettings.Logger.Error("Failed to parse secrets message", zap.Error(err))
+		return
+	}
+	s.secretsStore.Set(parsed)
+	s.telemetrySettings.Logger.Debug("Updated secrets cache", zap.Int("count", len(parsed)))
 }
 
 // setAgentDescription sets the agent description, merging in any user-specified attributes from the supervisor configuration.
@@ -1784,6 +1859,18 @@ func (s *Supervisor) Shutdown() {
 		}
 	}
 
+	if s.secretsStore != nil {
+		s.telemetrySettings.Logger.Debug("Stopping secrets broker...")
+		ctx, cancel := context.WithTimeout(s.runCtx, 5*time.Second)
+		defer cancel()
+
+		if err := s.secretsStore.Shutdown(ctx); err != nil {
+			s.telemetrySettings.Logger.Error("Could not stop the secrets broker", zap.Error(err))
+		} else {
+			s.telemetrySettings.Logger.Debug("Secrets broker stopped.")
+		}
+	}
+
 	if s.healthCheckServer != nil {
 		s.telemetrySettings.Logger.Debug("Stopping health check server...")
 		ctx, cancel := context.WithTimeout(s.runCtx, 5*time.Second)
@@ -1916,6 +2003,14 @@ func (s *Supervisor) onMessage(ctx context.Context, msg *types.MessageData) {
 	defer span.End()
 	configChanged := false
 
+	// Intercept and cache secrets BEFORE processing remote config, so the secrets
+	// referenced by the new config are available when the agent is (re)started.
+	secretsHandled := false
+	if s.config.Secrets.Enabled && msg.CustomMessage != nil && msg.CustomMessage.Capability == secrets.CapabilityName {
+		s.processSecretsMessage(msg.CustomMessage)
+		secretsHandled = true
+	}
+
 	if msg.AgentIdentification != nil {
 		configChanged = s.processAgentIdentificationMessage(msg.AgentIdentification) || configChanged
 	}
@@ -1958,8 +2053,9 @@ func (s *Supervisor) onMessage(ctx context.Context, msg *types.MessageData) {
 		haveMessageForAgent = true
 	}
 
-	// Proxy server messages to opamp extension
-	if msg.CustomMessage != nil {
+	// Proxy server messages to opamp extension (except secrets, which the
+	// supervisor consumes itself and serves locally to the collector).
+	if msg.CustomMessage != nil && !secretsHandled {
 		messageToAgent.CustomMessage = msg.CustomMessage
 		haveMessageForAgent = true
 	}

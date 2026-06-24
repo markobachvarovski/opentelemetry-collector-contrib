@@ -1,0 +1,34 @@
+# Supervisor config for the FULL path: the supervisor connects to Grafana Fleet
+# Management, receives secrets pushed over the OpAMP connection, and serves them
+# to the managed collector over a loopback endpoint. The collector resolves
+# ${grafanasecretsmanager:<name>} placeholders (delivered in the remote config)
+# via the grafanasecretsmanager provider.
+#
+# Run:
+#   ./bin/opampsupervisor_darwin_arm64 --config local-playground/grafana-secrets/supervisor.yaml
+
+server:
+  # MUST be https/wss — the supervisor refuses to enable secrets over plaintext.
+  endpoint: https://fleet-management.example.grafana.net/v1/opamp
+  headers:
+    # base64(tenant_id:token); the server scopes secrets by the tenant.
+    Authorization: "Basic ${env:GCLOUD_BASIC_AUTH_BASE64}"
+
+capabilities:
+  accepts_remote_config: true
+  reports_remote_config: true
+  reports_effective_config: true
+  reports_health: true
+
+# Opt in to the secrets broker.
+secrets:
+  enabled: true
+
+agent:
+  executable: ./bin/otelcontribcol_darwin_arm64
+  # The supervisor injects GRAFANA_SECRETS_MANAGER_ENDPOINT and
+  # GRAFANA_SECRETS_MANAGER_TOKEN automatically; add any extra env here.
+  env: {}
+
+storage:
+  directory: ./local-playground/grafana-secrets/supervisor-storage

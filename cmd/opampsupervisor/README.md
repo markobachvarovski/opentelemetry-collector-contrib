@@ -129,6 +129,22 @@ For more details on the healthcheck configuration, see the see the [full list of
 
 Note that the healthceck endpoint is not enabled by default. To enable it, you must explicitly set at least the `endpoint` field in the configuration.
 
+## Secrets
+
+The Supervisor can act as a local secrets broker for the managed Collector. When enabled, it receives secrets pushed by the OpAMP server over the existing connection (as an OpAMP custom message), caches them **in memory only**, and serves them to the Collector over a loopback endpoint. The Collector resolves them with the [`grafanasecretsmanager`](../../confmap/provider/grafanasecretsmanagerprovider/README.md) confmap provider, so the Collector never contacts the secrets server directly.
+
+```yaml
+secrets:
+  enabled: true
+```
+
+When enabled, the Supervisor:
+
+- Advertises a custom capability so the server may push secrets.
+- Injects `GRAFANA_SECRETS_MANAGER_ENDPOINT` and `GRAFANA_SECRETS_MANAGER_TOKEN` into the Collector's environment (in addition to any `agent::env` values) so the provider can read secrets from the loopback endpoint.
+
+This feature requires a TLS server endpoint (`https` or `wss`); the Supervisor refuses to start with `secrets::enabled` on a plaintext endpoint so secrets are never received over an unencrypted connection.
+
 ## Status
 
 The OpenTelemetry OpAMP Supervisor is intended to be the reference
